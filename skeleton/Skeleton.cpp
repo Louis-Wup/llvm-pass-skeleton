@@ -105,6 +105,53 @@ struct SkeletonPass : public PassInfoMixin<SkeletonPass> {
         return changed;
     }
 
+    bool runDeadAllocaElimination(Function &F) {
+        bool changed = false;
+        std::vector<AllocaInst*> deadAllocas;
+
+        for (auto &B : F) {
+            for (auto &I : B) {
+                if (auto *AI = dyn_cast<AllocaInst>(&I)) {
+                    bool isRead = false;
+                    for (auto *U : AI->users()) {
+                        if (isa<LoadInst>(U)) {
+                            isRead = true;
+                            break;
+                        }
+                        // If passed to a call, assume read
+                        if (isa<CallInst>(U)) {
+                            isRead = true;
+                            break;
+                        }
+                    }
+
+                    if (!isRead) {
+                        deadAllocas.push_back(AI);
+                    }
+                }
+            }
+        }
+
+        for (auto *AI : deadAllocas) {
+            // Remove all stores to this alloca
+            std::vector<Instruction*> usersToRemove;
+            for (auto *U : AI->users()) {
+                if (isa<StoreInst>(U)) {
+                    usersToRemove.push_back(cast<Instruction>(U));
+                }
+            }
+            
+            for (auto *I : usersToRemove) {
+                I->eraseFromParent();
+            }
+            
+            AI->eraseFromParent();
+            changed = true;
+        }
+
+        return changed;
+    }
+
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
         bool changed = false;
         bool passChanged;
@@ -121,6 +168,11 @@ struct SkeletonPass : public PassInfoMixin<SkeletonPass> {
                 }
 
                 if (runLocalDSE(F)) {
+                    passChanged = true;
+                    changed = true;
+                }
+
+                if (runDeadAllocaElimination(F)) {
                     passChanged = true;
                     changed = true;
                 }
