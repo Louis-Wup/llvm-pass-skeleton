@@ -8,17 +8,21 @@
 
 #include <unordered_map>
 #include <set>
+#include <map>
 
 using namespace llvm;
 
 namespace {
 
 struct SkeletonPass : public PassInfoMixin<SkeletonPass> {
-    PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
+    bool runIterativeDCE(Function &F) {
         bool changed = false;
-        for (auto &F : M.functions()) {
+        bool dceChanged = true;
+        while (dceChanged) {
+            dceChanged = false;
             std::set<Value *> used;
-            // 1. Collect used values
+            
+            // Collect used values
             for (auto &B : F) {
                 for (auto &I : B) {
                     for (auto &op : I.operands()) {
@@ -27,13 +31,10 @@ struct SkeletonPass : public PassInfoMixin<SkeletonPass> {
                 }
             }
 
-            // 2. Identify dead instructions
+            // Identify dead instructions
             std::vector<Instruction *> instsToRemove;
             for (auto &B : F) {
                 for (auto &I : B) {
-                    // Check if instruction produces a value (not void)
-                    // AND is not used
-                    // AND does not have side effects
                     if (!I.getType()->isVoidTy() &&
                         used.find(&I) == used.end() &&
                         !I.mayHaveSideEffects()) {
@@ -42,12 +43,91 @@ struct SkeletonPass : public PassInfoMixin<SkeletonPass> {
                 }
             }
 
-            // 3. Remove them
+            // Remove them
             for (auto *I : instsToRemove) {
+                I->eraseFromParent();
+                dceChanged = true;
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    bool runLocalDSE(Function &F) {
+        bool changed = false;
+        for (auto &B : F) {
+            std::map<Value *, Instruction *> last_def; // Pointer -> StoreInst
+            std::vector<Instruction *> storesToRemove;
+
+            for (auto &I : B) {
+                // Check Uses (inst.src)
+                if (auto *LI = dyn_cast<LoadInst>(&I)) {
+                    Value *ptr = LI->getPointerOperand();
+                    if (last_def.count(ptr)) {
+                        last_def.erase(ptr);
+                    }
+                }
+                else if (auto *CI = dyn_cast<CallInst>(&I)) {
+                    // CallInst might read from globals or arguments.
+                    for (auto it = last_def.begin(); it != last_def.end(); ) {
+                        if (isa<GlobalValue>(it->first)) {
+                            it = last_def.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                    for (auto &op : CI->args()) {
+                        if (last_def.count(op)) {
+                            last_def.erase(op);
+                        }
+                    }
+                }
+
+                // Check Defs (inst.dest)
+                if (auto *SI = dyn_cast<StoreInst>(&I)) {
+                    Value *dest = SI->getPointerOperand();
+                    if (last_def.count(dest)) {
+                        storesToRemove.push_back(last_def[dest]);
+                    }
+                    if (!SI->isVolatile()) {
+                        last_def[dest] = SI;
+                    } else {
+                        last_def.erase(dest);
+                    }
+                }
+            }
+
+            for (auto *I : storesToRemove) {
                 I->eraseFromParent();
                 changed = true;
             }
         }
+        return changed;
+    }
+
+    PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
+        bool changed = false;
+        bool passChanged;
+        
+        do {
+            passChanged = false;
+            
+            for (auto &F : M.functions()) {
+                if (F.isDeclaration()) continue;
+                
+                if (runIterativeDCE(F)) {
+                    passChanged = true;
+                    changed = true;
+                }
+
+                if (runLocalDSE(F)) {
+                    passChanged = true;
+                    changed = true;
+                }
+            }
+
+        } while (passChanged);
+
         return changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
     };
 };
