@@ -1,3 +1,4 @@
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Pass.h"
@@ -35,7 +36,8 @@ struct LVNPass : public PassInfoMixin<LVNPass> {
                 std::map<Value *, int> valueNumMap;
                 std::map<Expression, int> exprNumMap;
                 std::map<int, Value *> numToValueMap;
-                std::map<int, int> memoryMap; // VN_Ptr -> VN_Value
+                std::map<int, int> memoryMap;           // VN_Ptr -> VN_Value
+                std::map<int, Constant *> vnToConstant; // VN -> Constant
                 int nextVN = 1;
 
                 auto getValueNumber = [&](Value *V) -> int {
@@ -44,6 +46,11 @@ struct LVNPass : public PassInfoMixin<LVNPass> {
                     int vn = nextVN++;
                     valueNumMap[V] = vn;
                     numToValueMap[vn] = V;
+
+                    if (auto *C = dyn_cast<Constant>(V)) {
+                        vnToConstant[vn] = C;
+                    }
+
                     return vn;
                 };
 
@@ -75,9 +82,29 @@ struct LVNPass : public PassInfoMixin<LVNPass> {
                             // Map the redundant instruction to the existing VN
                             valueNumMap[BinOp] = vnFound;
                         } else {
-                            // New expression
-                            int newVN = getValueNumber(BinOp); // Assigns nextVN
-                            exprNumMap[expr] = newVN;
+                            // Constant Folding Check
+                            if (vnToConstant.count(vnL) &&
+                                vnToConstant.count(vnR)) {
+                                Constant *CL = vnToConstant[vnL];
+                                Constant *CR = vnToConstant[vnR];
+                                Constant *Folded = ConstantExpr::get(
+                                    BinOp->getOpcode(), CL, CR);
+
+                                // Replace instruction with the constant
+                                BinOp->replaceAllUsesWith(Folded);
+                                changed = true;
+
+                                // Treat the instruction as if it IS the
+                                // constant value
+                                int newVN = getValueNumber(Folded);
+                                valueNumMap[BinOp] = newVN;
+                                exprNumMap[expr] = newVN;
+                            } else {
+                                // Normal Case
+                                int newVN =
+                                    getValueNumber(BinOp); // Assigns nextVN
+                                exprNumMap[expr] = newVN;
+                            }
                         }
                     } else if (auto *Alloca = dyn_cast<AllocaInst>(&I)) {
                         // Unique VN for each alloca (pointer)
