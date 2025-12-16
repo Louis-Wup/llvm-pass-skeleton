@@ -218,6 +218,7 @@ struct DCEPass : public PassInfoMixin<DCEPass> {
     }
 
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
+        errs() << "Running DCE on " << M.getName() << "\n";
         bool changed = false;
         bool passChanged;
 
