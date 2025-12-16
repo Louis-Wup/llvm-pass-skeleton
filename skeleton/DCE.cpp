@@ -12,7 +12,7 @@ using namespace llvm;
 
 namespace {
 
-struct SkeletonPass : public PassInfoMixin<SkeletonPass> {
+struct DCEPass : public PassInfoMixin<DCEPass> {
     bool runIterativeDCE(Function &F) {
         bool changed = false;
         bool dceChanged = true;
@@ -255,21 +255,21 @@ struct SkeletonPass : public PassInfoMixin<SkeletonPass> {
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
 llvmGetPassPluginInfo() {
     return {.APIVersion = LLVM_PLUGIN_API_VERSION,
-            .PluginName = "Skeleton pass",
+            .PluginName = "DCE pass",
             .PluginVersion = "v0.1",
             .RegisterPassBuilderCallbacks = [](PassBuilder &PB) {
                 PB.registerPipelineParsingCallback(
                     [](StringRef Name, ModulePassManager &MPM,
                        ArrayRef<PassBuilder::PipelineElement>) {
-                        if (Name == "skeleton-pass") {
-                            MPM.addPass(SkeletonPass());
+                        if (Name == "dce-pass") {
+                            MPM.addPass(DCEPass());
                             return true;
                         }
                         return false;
                     });
                 PB.registerPipelineStartEPCallback(
                     [](ModulePassManager &MPM, OptimizationLevel Level) {
-                        MPM.addPass(SkeletonPass());
+                        MPM.addPass(DCEPass());
                     });
             }};
 }
