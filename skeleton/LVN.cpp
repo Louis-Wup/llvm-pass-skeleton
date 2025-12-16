@@ -55,6 +55,10 @@ struct LVNPass : public PassInfoMixin<LVNPass> {
                         int vnL = getValueNumber(L);
                         int vnR = getValueNumber(R);
 
+                        if (BinOp->isCommutative() && vnL > vnR) {
+                            std::swap(vnL, vnR);
+                        }
+
                         Expression expr{BinOp->getOpcode(), vnL, vnR};
 
                         if (exprNumMap.count(expr)) {
