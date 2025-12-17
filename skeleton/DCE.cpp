@@ -4,6 +4,7 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Analysis/ValueTracking.h"
 
 #include <map>
 #include <set>
@@ -128,20 +129,33 @@ struct DCEPass : public PassInfoMixin<DCEPass> {
                     }
                 } else if (auto *CI = dyn_cast<CallInst>(&I)) {
                     // CallInst might read from globals or arguments.
+                    // 1. Identify escaped pointers (non-allocas) and aliased arguments
                     for (auto it = last_def.begin(); it != last_def.end();) {
-                        if (isa<GlobalValue>(it->first)) {
+                        Value *root = it->first;
+                        const Value *obj = getUnderlyingObject(root);
+
+                        bool shouldRemove = false;
+
+                        // If not an Alloca, assume it's escaped (Global, etc.)
+                        if (!isa<AllocaInst>(obj)) {
+                            shouldRemove = true;
+                        } else {
+                            // It is an Alloca, check if it's passed to the call
+                            for (auto &arg : CI->args()) {
+                                if (arg->getType()->isPointerTy()) {
+                                    const Value *argObj = getUnderlyingObject(arg);
+                                    if (argObj == obj) {
+                                        shouldRemove = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (shouldRemove) {
                             it = last_def.erase(it);
                         } else {
                             ++it;
-                        }
-                    }
-                    for (auto &op : CI->args()) {
-                        if (op->getType()->isPointerTy()) { // Only check
-                                                            // pointer arguments
-                            Value *root = dsu.find(op);
-                            if (last_def.count(root)) {
-                                last_def.erase(root);
-                            }
                         }
                     }
                 }
@@ -154,7 +168,7 @@ struct DCEPass : public PassInfoMixin<DCEPass> {
                     if (last_def.count(root)) {
                         storesToRemove.push_back(last_def[root]);
                     }
-                    if (!SI->isVolatile()) {
+                    if (!SI->isVolatile() && !SI->isAtomic()) {
                         last_def[root] = SI;
                     } else {
                         last_def.erase(root);
