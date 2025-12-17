@@ -8,13 +8,15 @@
 
 #include <map>
 #include <set>
+#include <vector>
+#include <utility>
 
 using namespace llvm;
 
 namespace {
 
 struct DCEPass : public PassInfoMixin<DCEPass> {
-    bool runIterativeDCE(Function &F) {
+    bool runTDCE(Function &F) {
         bool changed = false;
         bool dceChanged = true;
         while (dceChanged) {
@@ -70,33 +72,65 @@ struct DCEPass : public PassInfoMixin<DCEPass> {
         }
     };
 
-    bool runLocalDSE(Function &F) {
+    // Helper to decompose a pointer into its base and indices
+    struct PointerDecomposition {
+        Value *Base;
+        std::vector<Value *> Indices;
+
+        bool operator<(const PointerDecomposition &other) const {
+            if (Base != other.Base)
+                return Base < other.Base;
+            return Indices < other.Indices;
+        }
+    };
+
+    PointerDecomposition decomposePointer(Value *Ptr) {
+        std::vector<Value *> Indices;
+        Value *Current = Ptr;
+
+        std::set<Value *> Visited; // Prevent infinite loops
+        while (true) {
+            if (Visited.count(Current)) {
+                break;
+            }
+            Visited.insert(Current);
+
+            if (auto *GEP = dyn_cast<GetElementPtrInst>(Current)) {
+                for (auto &idx : GEP->indices()) {
+                    Indices.push_back(idx.get());
+                }
+                Current = GEP->getPointerOperand();
+            } else if (auto *BC = dyn_cast<BitCastInst>(Current)) {
+                Current = BC->getOperand(0);
+            } else {
+                break;
+            }
+        }
+        return {Current, Indices};
+    }
+
+    bool runLocalDCE(Function &F) {
         bool changed = false;
         for (auto &B : F) {
             DisjointSet dsu;
             std::map<Value *, Value *> memory_map; // Ptr -> Value stored there
 
-            // Build alias sets for the block
+            // 1. Build Alias Sets (DSU)
+            // We only track value flow here (BitCast, Load/Store forwarding).
+            // GEP offsets are handled by decomposition.
             for (auto &I : B) {
                 if (auto *BC = dyn_cast<BitCastInst>(&I)) {
                     dsu.unionSets(BC, BC->getOperand(0));
                 } else if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+                    // Only 0-index GEPs alias the base pointer value directly
                     if (GEP->hasAllZeroIndices()) {
                         dsu.unionSets(GEP, GEP->getPointerOperand());
                     }
                 } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
                     Value *ptr = SI->getPointerOperand();
                     Value *val = SI->getValueOperand();
-                    // Only track simple pointer stores for alias propagation
                     if (val->getType()->isPointerTy() && !SI->isVolatile()) {
                         memory_map[dsu.find(ptr)] = val;
-                        // errs() << "MemMap[" << dsu.find(ptr) << "] = " << val
-                        // << " (from " << *SI << ")\n";
-                    } else {
-                        // If storing non-pointer or volatile, we might want to
-                        // invalidate, but for 'ptr to ptr' tracking, mostly
-                        // overwriting is enough. Conservative: if we don't know
-                        // what we are bringing in, we can't propagate.
                     }
                 } else if (auto *LI = dyn_cast<LoadInst>(&I)) {
                     if (LI->getType()->isPointerTy()) {
@@ -104,19 +138,15 @@ struct DCEPass : public PassInfoMixin<DCEPass> {
                         Value *root = dsu.find(ptr);
                         if (memory_map.count(root)) {
                             dsu.unionSets(LI, memory_map[root]);
-                            // errs() << "Union(" << *LI << ", " <<
-                            // *memory_map[root] << ")\n";
                         }
                     }
                 } else if (isa<CallInst>(&I) || isa<InvokeInst>(&I)) {
-                    // Calls might modify memory. Conservatively clear our
-                    // knowledge.
                     memory_map.clear();
                 }
             }
 
-            std::map<Value *, Instruction *>
-                last_def; // Representative Pointer -> StoreInst
+            // 2. Dead Store Elimination
+            std::map<PointerDecomposition, Instruction *> last_def;
             std::vector<Instruction *> storesToRemove;
 
             for (auto &I : B) {
@@ -124,24 +154,27 @@ struct DCEPass : public PassInfoMixin<DCEPass> {
                 if (auto *LI = dyn_cast<LoadInst>(&I)) {
                     Value *ptr = LI->getPointerOperand();
                     Value *root = dsu.find(ptr);
-                    if (last_def.count(root)) {
-                        last_def.erase(root);
+                    PointerDecomposition key = decomposePointer(root);
+                    
+                    if (last_def.count(key)) {
+                        last_def.erase(key);
                     }
                 } else if (auto *CI = dyn_cast<CallInst>(&I)) {
-                    // CallInst might read from globals or arguments.
-                    // 1. Identify escaped pointers (non-allocas) and aliased arguments
+                    // Conservative: Clear everything that might escape
+                    // For simplicity in this assignment, we clear everything
+                    // or we could implement the escape analysis again.
+                    // Let's reuse the logic: check if base object is Alloca and not escaped.
+                    
                     for (auto it = last_def.begin(); it != last_def.end();) {
-                        Value *root = it->first;
-                        const Value *obj = getUnderlyingObject(root);
+                        Value *base = it->first.Base;
+                        const Value *obj = getUnderlyingObject(base);
 
                         bool shouldRemove = false;
-
-                        // If not an Alloca, assume it's escaped (Global, etc.)
                         if (!isa<AllocaInst>(obj)) {
                             shouldRemove = true;
                         } else {
-                            // It is an Alloca, check if it's passed to the call
-                            for (auto &arg : CI->args()) {
+                            // Check if passed to call
+                             for (auto &arg : CI->args()) {
                                 if (arg->getType()->isPointerTy()) {
                                     const Value *argObj = getUnderlyingObject(arg);
                                     if (argObj == obj) {
@@ -164,14 +197,15 @@ struct DCEPass : public PassInfoMixin<DCEPass> {
                 if (auto *SI = dyn_cast<StoreInst>(&I)) {
                     Value *dest = SI->getPointerOperand();
                     Value *root = dsu.find(dest);
+                    PointerDecomposition key = decomposePointer(root);
 
-                    if (last_def.count(root)) {
-                        storesToRemove.push_back(last_def[root]);
+                    if (last_def.count(key)) {
+                        storesToRemove.push_back(last_def[key]);
                     }
                     if (!SI->isVolatile() && !SI->isAtomic()) {
-                        last_def[root] = SI;
+                        last_def[key] = SI;
                     } else {
-                        last_def.erase(root);
+                        last_def.erase(key);
                     }
                 }
             }
@@ -193,12 +227,17 @@ struct DCEPass : public PassInfoMixin<DCEPass> {
                 if (auto *AI = dyn_cast<AllocaInst>(&I)) {
                     bool isRead = false;
                     for (auto *U : AI->users()) {
-                        if (isa<LoadInst>(U)) {
-                            isRead = true;
-                            break;
-                        }
-                        // If passed to a call, assume read
-                        if (isa<CallInst>(U)) {
+                        if (auto *SI = dyn_cast<StoreInst>(U)) {
+                            if (SI->getValueOperand() == AI) {
+                                isRead = true; // Stored as value (escapes)
+                                break;
+                            }
+                            // If AI is pointer operand, it's a write.
+                        } else {
+                            // Any other user (Load, Call, GEP, BitCast, etc.)
+                            // Assume it keeps the alloca live.
+                            // We could recurse for GEP/BitCast to check if they are only used by stores,
+                            // but for now, let's be safe to avoid crashes.
                             isRead = true;
                             break;
                         }
@@ -243,12 +282,12 @@ struct DCEPass : public PassInfoMixin<DCEPass> {
                 if (F.isDeclaration())
                     continue;
 
-                if (runIterativeDCE(F)) {
+                if (runTDCE(F)) {
                     passChanged = true;
                     changed = true;
                 }
 
-                if (runLocalDSE(F)) {
+                if (runLocalDCE(F)) {
                     passChanged = true;
                     changed = true;
                 }
