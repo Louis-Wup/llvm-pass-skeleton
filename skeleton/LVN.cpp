@@ -10,135 +10,129 @@
 
 using namespace llvm;
 
-namespace {
+namespace{
 
-struct Expression {
-    unsigned Opcode;
-    int LHS, RHS;
+struct Expression{
+    int opcode;
+    int lhs;
+    int rhs;
 
-    bool operator<(const Expression &O) const {
-        return std::tie(Opcode, LHS, RHS) < std::tie(O.Opcode, O.LHS, O.RHS);
+    bool operator<(const Expression &expr) const{
+        return std::tie(opcode, lhs, rhs) < std::tie(expr.opcode, expr.lhs, expr.rhs);
     }
 };
 
-struct LVNPass : public PassInfoMixin<LVNPass> {
-    PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
+struct LVNContext{
+    std::map<Value *, int> var2num; // variable -> number
+    std::map<Expression, int> expr2num; // expression -> number
+    std::map<int, Value *> num2var; // number -> variable
+    std::map<int, int> varnum2valnum; // variable number -> value number(notice constant also seen as variable, need use num2const get value)
+    std::map<int, Constant *> num2const; // number -> constant value(but in LLVM form)
+    int numberCnt = 1;
+
+    int getVarNumber(Value *var){
+        if (var2num.count(var)){
+            return var2num[var];
+        }
+        int number = numberCnt++;
+        var2num[var] = number;
+        num2var[number] = var;
+
+        if (auto *c = dyn_cast<Constant>(var)){
+            num2const[number] = c;
+        }
+
+        return number;
+    }
+};
+
+struct LVNPass : public PassInfoMixin<LVNPass>{
+    PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM){
         errs() << "Running LVN on module " << M.getName() << "\n";
         bool changed = false;
 
-        for (auto &F : M) {
-            if (F.isDeclaration())
+        for(auto &F : M){
+            if(F.isDeclaration()){
                 continue;
+            }
 
-            // errs() << "  Processing function: " << F.getName() << "\n";
+            for(auto &BB : F){
+                LVNContext ctx;
 
-            for (auto &BB : F) {
-                std::map<Value *, int> valueNumMap;
-                std::map<Expression, int> exprNumMap;
-                std::map<int, Value *> numToValueMap;
-                std::map<int, int> memoryMap;           // VN_Ptr -> VN_Value
-                std::map<int, Constant *> vnToConstant; // VN -> Constant
-                int nextVN = 1;
+                for(auto &I : BB){
+                    if(auto *binOp = dyn_cast<BinaryOperator>(&I)){
+                        Value *l = binOp->getOperand(0);
+                        Value *r = binOp->getOperand(1);
 
-                auto getValueNumber = [&](Value *V) -> int {
-                    if (valueNumMap.count(V))
-                        return valueNumMap[V];
-                    int vn = nextVN++;
-                    valueNumMap[V] = vn;
-                    numToValueMap[vn] = V;
+                        int numL = ctx.getVarNumber(l);
+                        int numR = ctx.getVarNumber(r);
 
-                    if (auto *C = dyn_cast<Constant>(V)) {
-                        vnToConstant[vn] = C;
-                    }
-
-                    return vn;
-                };
-
-                for (auto &I : BB) {
-                    if (auto *BinOp = dyn_cast<BinaryOperator>(&I)) {
-                        Value *L = BinOp->getOperand(0);
-                        Value *R = BinOp->getOperand(1);
-
-                        int vnL = getValueNumber(L);
-                        int vnR = getValueNumber(R);
-
-                        if (BinOp->isCommutative() && vnL > vnR) {
-                            std::swap(vnL, vnR);
+                        if(binOp->isCommutative() && numL > numR){
+                            std::swap(numL, numR);
                         }
 
-                        Expression expr{BinOp->getOpcode(), vnL, vnR};
+                        Expression expr{binOp->getOpcode(), numL, numR};
 
-                        if (exprNumMap.count(expr)) {
-                            // Redundancy found!
-                            int vnFound = exprNumMap[expr];
-                            Value *replacement = numToValueMap[vnFound];
+                        if(ctx.expr2num.count(expr)){
+                            int numFound = ctx.expr2num[expr];
+                            Value *replacement = ctx.num2var[numFound];
 
-                            // Replace all uses of this instruction with the
-                            // found value. This effectively makes 'BinOp' dead
-                            // code.
-                            BinOp->replaceAllUsesWith(replacement);
+                            binOp->replaceAllUsesWith(replacement);
                             changed = true;
 
-                            // Map the redundant instruction to the existing VN
-                            valueNumMap[BinOp] = vnFound;
-                        } else {
-                            // Constant Folding Check
-                            if (vnToConstant.count(vnL) &&
-                                vnToConstant.count(vnR)) {
-                                Constant *CL = vnToConstant[vnL];
-                                Constant *CR = vnToConstant[vnR];
-                                Constant *Folded = ConstantExpr::get(
-                                    BinOp->getOpcode(), CL, CR);
+                            ctx.var2num[binOp] = numFound;
+                        }
+                        else{
+                            if(ctx.num2const.count(numL) && ctx.num2const.count(numR)){
+                                Constant *cl = ctx.num2const[numL];
+                                Constant *cr = ctx.num2const[numR];
+                                Constant *folded = ConstantExpr::get(binOp->getOpcode(), cl, cr);
 
-                                // Replace instruction with the constant
-                                BinOp->replaceAllUsesWith(Folded);
+                                binOp->replaceAllUsesWith(folded);
                                 changed = true;
 
-                                // Treat the instruction as if it IS the
-                                // constant value
-                                int newVN = getValueNumber(Folded);
-                                valueNumMap[BinOp] = newVN;
-                                exprNumMap[expr] = newVN;
-                            } else {
-                                // Normal Case
-                                int newVN =
-                                    getValueNumber(BinOp); // Assigns nextVN
-                                exprNumMap[expr] = newVN;
+                                int newNum = ctx.getVarNumber(folded);
+                                ctx.var2num[binOp] = newNum;
+                                ctx.expr2num[expr] = newNum;
+                            }
+                            else{
+                                int newNum = ctx.getVarNumber(binOp);
+                                ctx.expr2num[expr] = newNum;
                             }
                         }
-                    } else if (auto *Alloca = dyn_cast<AllocaInst>(&I)) {
-                        // Unique VN for each alloca (pointer)
-                        getValueNumber(Alloca);
-                    } else if (auto *Store = dyn_cast<StoreInst>(&I)) {
-                        Value *Val = Store->getValueOperand();
-                        Value *Ptr = Store->getPointerOperand();
+                    }
+                    else if(auto *alloca = dyn_cast<AllocaInst>(&I)){
+                        ctx.getVarNumber(alloca);
+                    }
+                    else if(auto *store = dyn_cast<StoreInst>(&I)){
+                        Value *value = store->getValueOperand();
+                        Value *var = store->getPointerOperand();
 
-                        int vnVal = getValueNumber(Val);
-                        int vnPtr = getValueNumber(Ptr);
+                        int numValue = ctx.getVarNumber(value);
+                        int numVar = ctx.getVarNumber(var);
 
-                        memoryMap[vnPtr] = vnVal;
-                    } else if (auto *Load = dyn_cast<LoadInst>(&I)) {
-                        Value *Ptr = Load->getPointerOperand();
-                        int vnPtr = getValueNumber(Ptr);
+                        ctx.varnum2valnum[numVar] = numValue;
+                    }
+                    else if(auto *load = dyn_cast<LoadInst>(&I)){
+                        Value *var = load->getPointerOperand();
+                        int numVar = ctx.getVarNumber(var);
 
-                        if (memoryMap.count(vnPtr)) {
-                            // We know what's stored here!
-                            int vnVal = memoryMap[vnPtr];
-                            Value *replacement = numToValueMap[vnVal];
+                        if(ctx.varnum2valnum.count(numVar)){
+                            int numValue = ctx.varnum2valnum[numVar];
+                            Value *replacement = ctx.num2var[numValue];
 
-                            Load->replaceAllUsesWith(replacement);
+                            load->replaceAllUsesWith(replacement);
                             changed = true;
 
-                            // Map this load to that value
-                            valueNumMap[Load] = vnVal;
-                        } else {
-                            // Unknown value (first load or unknown memory)
-                            int newVN = getValueNumber(Load);
-                            memoryMap[vnPtr] = newVN; // Assume consistent
+                            ctx.var2num[load] = numValue;
                         }
-                    } else {
-                        // For other ops, just assign a VN
-                        getValueNumber(&I);
+                        else{
+                            int numValue = ctx.getVarNumber(load);
+                            ctx.varnum2valnum[numVar] = numValue;
+                        }
+                    }
+                    else{
+                        ctx.getVarNumber(&I);
                     }
                 }
             }
