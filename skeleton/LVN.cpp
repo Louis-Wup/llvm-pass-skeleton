@@ -10,7 +10,7 @@
 
 using namespace llvm;
 
-namespace{
+namespace {
 
 struct Expression{
     int opcode;
@@ -28,7 +28,7 @@ struct LVNContext{
     std::map<int, Value *> num2var; // number -> variable
     std::map<int, int> varnum2valnum; // variable number -> value number(notice constant also seen as variable, need use num2const get value)
     std::map<int, Constant *> num2const; // number -> constant value(but in LLVM form)
-    int numberCnt = 1;
+    int numberCnt = 0;
 
     int getVarNumber(Value *var){
         if (var2num.count(var)){
